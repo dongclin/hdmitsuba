@@ -268,6 +268,89 @@ def test_curve_bspline_type():
   )
 
 
+@pytest.mark.parametrize(
+    'wrap, trim, num_segments',
+    [(UsdGeom.Tokens.nonperiodic, 1, 9), (UsdGeom.Tokens.pinned, 0, 14)],
+)
+def test_curve_catmull_rom_type(wrap: str, trim: int, num_segments: int):
+  stage = Usd.Stage.Open(f'{test_helpers.TEST_ASSETS_PATH}/shapes/curve.usda')
+  test_helpers.create_render_settings(stage, resolution=(128, 128))
+  curve = UsdGeom.BasisCurves.Get(stage, '/root/mycurve/curve')
+  curve.GetBasisAttr().Set(UsdGeom.Tokens.catmullRom)
+  curve.GetTypeAttr().Set(UsdGeom.Tokens.cubic)
+  curve.GetWrapAttr().Set(wrap)
+  # 2-, 5-, and 10-point strands (17 points total) with a zero-width tip.
+  curve.GetCurveVertexCountsAttr().Set(Vt.IntArray([2, 5, 10]))
+  curve.GetWidthsAttr().Set(Vt.FloatArray([0.1] * 16 + [0.0]))
+  UsdGeom.Primvar(curve.GetWidthsAttr()).SetInterpolation(UsdGeom.Tokens.vertex)
+  engine = usd_render.RenderEngine(stage)
+  engine.configure(hydra_delegate_id='HdMitsubaRendererPlugin')
+  image_hd, _ = test_helpers.assert_hydra_equal_to_offline(
+      stage,
+      output_prefix=f'test_curve_catmull_rom_{wrap}',
+      atol=0.05,
+      engine=engine,
+  )
+  assert np.max(image_hd[..., :3]) > 0.05
+
+  scene_dict = test_helpers.usd_mitsuba.convert_to_mitsuba(stage)
+  params = mi.traverse(scene_dict['_root_mycurve_curve'])
+  assert params['control_point_count'] == 4 * num_segments
+  control_points = np.array(params['control_points']).reshape(
+      num_segments, 4, 4
+  )
+
+  # Cubic B-spline segment endpoints (B0 + 4*B1 + B2)/6 and (B1 + 4*B2 + B3)/6
+  # (positions and radii) and endpoint tangents (B2 - B0)/2 and (B3 - B1)/2
+  # must match Catmull-Rom losslessly.
+  points = np.array(curve.GetPointsAttr().Get())
+  radii = np.array(curve.GetWidthsAttr().Get())[:, None] * 0.5
+  points_with_radii = np.hstack([points, radii])
+  strands = np.split(points_with_radii, [2, 7])
+  segment_starts = (
+      control_points[:, 0] + 4.0 * control_points[:, 1] + control_points[:, 2]
+  ) / 6.0
+  segment_ends = (
+      control_points[:, 1] + 4.0 * control_points[:, 2] + control_points[:, 3]
+  ) / 6.0
+  start_tangents = (control_points[:, 2, :3] - control_points[:, 0, :3]) * 0.5
+  end_tangents = (control_points[:, 3, :3] - control_points[:, 1, :3]) * 0.5
+  np.testing.assert_allclose(
+      segment_starts,
+      np.concatenate(
+          [strand[trim : len(strand) - 1 - trim] for strand in strands]
+      ),
+      atol=1e-5,
+  )
+  np.testing.assert_allclose(
+      segment_ends,
+      np.concatenate(
+          [strand[trim + 1 : len(strand) - trim] for strand in strands]
+      ),
+      atol=1e-5,
+  )
+  # Segment 0 is points[2..5] when nonperiodic skips the 2-point first strand,
+  # and the phantom-reflected 2-point strand points[0..1] when pinned.
+  expected_start_tangent = (
+      (points[4] - points[2]) * 0.5 if trim else points[1] - points[0]
+  )
+  expected_end_tangent = (
+      (points[5] - points[3]) * 0.5 if trim else points[1] - points[0]
+  )
+  np.testing.assert_allclose(
+      start_tangents[0], expected_start_tangent, atol=1e-5
+  )
+  np.testing.assert_allclose(end_tangents[0], expected_end_tangent, atol=1e-5)
+
+  # Invalid topology: negative count (sum == 17) vs. sum mismatch (16 != 17).
+  curve.GetCurveVertexCountsAttr().Set(
+      Vt.IntArray([-1, 8, 10] if trim else [2, 5, 9])
+  )
+  assert np.max(engine.render()['color'][..., :3]) < 0.01
+  with pytest.raises(ValueError, match='/root/mycurve/curve'):
+    test_helpers.usd_mitsuba.convert_to_mitsuba(stage)
+
+
 def test_curve_width_world_scale():
   stage_ref = Usd.Stage.Open(
       f'{test_helpers.TEST_ASSETS_PATH}/shapes/curve.usda'
