@@ -274,53 +274,37 @@ def _create_empty_mitsuba_curve(curve_type: str, bsdf: Any) -> mi.Object:
 
 # M_bspline^-1 @ M_catmullRom (tension 0.5), identical to
 # kCatmullRomToBSpline in curves.cc.
-_CATMULL_ROM_TO_BSPLINE = np.array(
-    [[7, -4, 5, -2], [-2, 11, -4, 1], [1, -4, 11, -2], [-2, 5, -4, 7]],
-    dtype=np.float32,
-) / np.float32(6.0)
+_CATMULL_ROM_TO_BSPLINE = (
+    np.array(
+        [[7, -4, 5, -2], [-2, 11, -4, 1], [1, -4, 11, -2], [-2, 5, -4, 7]],
+        dtype=np.float32,
+    )
+    / 6.0
+)
 
 
 def _catmull_rom_to_bspline(
-    control_points: np.ndarray,
-    vertex_counts: np.ndarray,
-    pinned: bool = False,
+    points: np.ndarray, counts: np.ndarray, pinned: bool
 ) -> tuple[np.ndarray, np.ndarray]:
-  """Converts Catmull-Rom strands into disjoint 4-point B-spline segments.
-
-  Mirrors ConvertCatmullRomToBSpline in hdmitsuba/curves.cc; for pinned curves,
-  reflects phantom endpoint positions while clamping endpoint radii.
-
-  Args:
-    control_points: (P, 4) float32 array of world-space xyz + radius.
-    vertex_counts: (S,) int32 array of point counts per strand.
-    pinned: Whether the curve uses wrap = "pinned".
-
-  Returns:
-    Tuple of (4K, 4) B-spline control points and (K,) strand vertex counts.
-  """
-  points = np.asarray(control_points, dtype=np.float32)
-  counts = np.asarray(vertex_counts, dtype=np.int32)
+  """Converts Catmull-Rom strands into disjoint 4-point B-spline segments."""
   first = -1 if pinned else 0
-
-  # Window indices run from `first` to `count - 1 - first` in each strand.
   segment_counts = np.maximum(0, counts - 3 - 2 * first)
-  strand = np.repeat(np.arange(counts.size, dtype=np.int32), segment_counts)
-  segment_offsets = np.cumsum(segment_counts, dtype=np.int32) - segment_counts
-  start = (
-      np.arange(strand.size, dtype=np.int32) - segment_offsets[strand] + first
-  )
-  local = start[:, None] + np.arange(4, dtype=np.int32)  # (K, 4)
-  strand_offsets = (np.cumsum(counts, dtype=np.int32) - counts)[strand][:, None]
-  clamped = np.clip(local, 0, counts[strand][:, None] - 1)
-  anchor = strand_offsets + clamped
-  windows = points[anchor]  # (K, 4, 4)
+  strand = np.repeat(np.arange(counts.size), segment_counts)
+  local = (
+      np.arange(strand.size)
+      - (np.cumsum(segment_counts) - segment_counts)[strand]
+      + first
+  )[:, None] + np.arange(4)
+  clamped = np.clip(local, 0, counts[strand, None] - 1)
+  anchor = (np.cumsum(counts) - counts)[strand, None] + clamped
+  windows = points[anchor]
   if pinned:
-    neighbor = anchor + clamped - local
-    windows[..., :3] *= np.float32(2.0)
-    windows[..., :3] -= points[neighbor, :3]
-
-  bspline = (_CATMULL_ROM_TO_BSPLINE @ windows).reshape(4 * strand.size, 4)
-  return bspline, np.full(strand.size, 4, dtype=np.int32)
+    windows[..., :3] = (
+        2.0 * windows[..., :3] - points[anchor + clamped - local, :3]
+    )
+  return (_CATMULL_ROM_TO_BSPLINE @ windows).reshape(-1, 4), np.full(
+      strand.size, 4
+  )
 
 
 def _convert_curves(
@@ -398,9 +382,9 @@ def _convert_curves(
         f' {degree}.'
     )
   skipped = curve_point_counts - repeats
-  indices = np.arange(repeats.sum(), dtype=np.int32)
-  per_strand_offset = np.cumsum(skipped, dtype=np.int32) - skipped
-  curve_indices = indices + np.repeat(per_strand_offset, repeats)
+  curve_indices = np.arange(repeats.sum()) + np.repeat(
+      np.cumsum(skipped) - skipped, repeats
+  )
 
   curve_obj = _create_empty_mitsuba_curve(curve_type, bsdf)
   params = mi.traverse(curve_obj)
