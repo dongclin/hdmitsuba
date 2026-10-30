@@ -15,6 +15,8 @@
 #include "hdmitsuba/curves.h"
 
 #include <pxr/base/gf/matrix4d.h>
+#include <pxr/base/gf/matrix4f.h>
+#include <pxr/base/gf/vec4f.h>
 #include <pxr/base/tf/diagnostic.h>
 #include <pxr/base/tf/token.h>
 #include <pxr/base/vt/types.h>
@@ -38,8 +40,6 @@
 
 #include <algorithm>
 #include <cstddef>
-#include <string>
-#include <utility>
 #include <vector>
 
 #include "hdmitsuba/debug_codes.h"
@@ -80,52 +80,41 @@ std::vector<float> PackControlPoints(const VtVec3fArray& points,
 // M_bspline^-1 * M_catmullRom. With `wrap = pinned`, reflects phantom
 // endpoint positions (2*P_0 - P_1, 2*P_{N-1} - P_{N-2}) while clamping
 // endpoint radii so tapered tips do not extrapolate to negative radii.
-// Keep in sync with _catmull_rom_to_bspline in usd_mitsuba/translator.py.
-void ConvertCatmullRomToBSpline(bool pinned, VtIntArray& vertex_counts,
-                                std::vector<float>& control_points) {
-  static constexpr float kCatmullRomToBSpline[4][4] = {
-      {7.0f / 6.0f, -4.0f / 6.0f, 5.0f / 6.0f, -2.0f / 6.0f},
-      {-2.0f / 6.0f, 11.0f / 6.0f, -4.0f / 6.0f, 1.0f / 6.0f},
-      {1.0f / 6.0f, -4.0f / 6.0f, 11.0f / 6.0f, -2.0f / 6.0f},
-      {-2.0f / 6.0f, 5.0f / 6.0f, -4.0f / 6.0f, 7.0f / 6.0f},
-  };
+std::vector<float> ConvertCatmullRomToBSpline(
+    bool pinned, const VtIntArray& vertex_counts,
+    const std::vector<float>& control_points) {
+  static const GfMatrix4f kCatmullRomToBSpline(
+      7.0f / 6.0f, -4.0f / 6.0f, 5.0f / 6.0f, -2.0f / 6.0f, -2.0f / 6.0f,
+      11.0f / 6.0f, -4.0f / 6.0f, 1.0f / 6.0f, 1.0f / 6.0f, -4.0f / 6.0f,
+      11.0f / 6.0f, -2.0f / 6.0f, -2.0f / 6.0f, 5.0f / 6.0f, -4.0f / 6.0f,
+      7.0f / 6.0f);
   int first = pinned ? -1 : 0;
   size_t num_segments = 0;
-  for (int count : vertex_counts.AsConst()) {
+  for (int count : vertex_counts) {
     num_segments += std::max(0, count - 3 - 2 * first);
   }
   std::vector<float> bspline_points(num_segments * 16);
   float* out = bspline_points.data();
   int offset = 0;
-  for (int count : vertex_counts.AsConst()) {
+  for (int count : vertex_counts) {
     for (int start = first; start + 3 <= count - 1 - first; ++start) {
-      float window[4][4];
+      GfMatrix4f window;
       for (int k = 0; k < 4; ++k) {
         int local = start + k;
         int clamped = std::clamp(local, 0, count - 1);
         // For in-range indices, clamped == local, so 2*anchor - neighbor ==
         // anchor.
-        const float* anchor = &control_points[4 * (offset + clamped)];
-        const float* neighbor =
-            &control_points[4 * (offset + 2 * clamped - local)];
-        for (int axis = 0; axis < 3; ++axis) {
-          window[k][axis] = 2.0f * anchor[axis] - neighbor[axis];
-        }
-        window[k][3] = anchor[3];
+        GfVec4f anchor(&control_points[4 * (offset + clamped)]);
+        GfVec4f neighbor(&control_points[4 * (offset + 2 * clamped - local)]);
+        GfVec4f row = 2.0f * anchor - neighbor;
+        row[3] = anchor[3];
+        window.SetRow(k, row);
       }
-      for (int row = 0; row < 4; ++row, out += 4) {
-        for (int col = 0; col < 4; ++col) {
-          out[col] = kCatmullRomToBSpline[row][0] * window[0][col] +
-                     kCatmullRomToBSpline[row][1] * window[1][col] +
-                     kCatmullRomToBSpline[row][2] * window[2][col] +
-                     kCatmullRomToBSpline[row][3] * window[3][col];
-        }
-      }
+      out = std::copy_n((kCatmullRomToBSpline * window).data(), 16, out);
     }
     offset += count;
   }
-  vertex_counts = VtIntArray(num_segments, 4);
-  control_points = std::move(bspline_points);
+  return bspline_points;
 }
 
 }  // namespace
@@ -212,7 +201,7 @@ void HdMitsubaCurves::Sync(HdSceneDelegate* sceneDelegate,
       is_catmull_rom) {
     plugin_name = "bsplinecurve";
   }
-  VtIntArray vertex_counts =
+  const VtIntArray vertex_counts =
       GetParam<VtIntArray>(data_source, vertex_counts_locator);
 
   if (points_.empty() || widths_.empty()) {
@@ -224,18 +213,17 @@ void HdMitsubaCurves::Sync(HdSceneDelegate* sceneDelegate,
     return;
   }
 
-  bool has_negative_count = false;
-  size_t total_vertices = 0;
-  for (int count : vertex_counts.AsConst()) {
-    has_negative_count |= count < 0;
-    total_vertices += std::max(0, count);
+  int min_count = 0;
+  ptrdiff_t total_vertices = 0;
+  for (int count : vertex_counts) {
+    min_count = std::min(min_count, count);
+    total_vertices += count;
   }
-  if (has_negative_count || total_vertices != points_.size()) {
+  if (min_count < 0 || static_cast<size_t>(total_vertices) != points_.size()) {
     TF_WARN(
-        "Curves %s: curveVertexCounts sum to %zu (has_negative=%d) but "
-        "there are %zu points. Fix the curve topology in the USD asset. "
-        "Removing from scene.",
-        id.GetText(), total_vertices, has_negative_count, points_.size());
+        "Curves %s: curveVertexCounts sum to %td (min %d) but there are %zu "
+        "points. Fix the curve topology in the USD asset. Removing from scene.",
+        id.GetText(), total_vertices, min_count, points_.size());
     RemoveFromScene(scene_manager);
     *dirtyBits = HdChangeTracker::Clean;
     return;
@@ -266,9 +254,8 @@ void HdMitsubaCurves::Sync(HdSceneDelegate* sceneDelegate,
         points_, [&](size_t /*i*/) { return uniform_radius; });
   }
 
-  // Catmull-Rom: rewrite as equivalent B-spline strands.
   if (is_catmull_rom) {
-    ConvertCatmullRomToBSpline(
+    spec.control_points = ConvertCatmullRomToBSpline(
         GetParam<TfToken>(data_source, wrap_locator) == HdTokens->pinned,
         vertex_counts, spec.control_points);
   }
@@ -276,7 +263,9 @@ void HdMitsubaCurves::Sync(HdSceneDelegate* sceneDelegate,
   // Generate segment indices
   int degree = (spec.plugin_name == "bsplinecurve") ? 3 : 1;
   int accumulated_vertices = 0;
-  for (int count : vertex_counts.AsConst()) {
+  for (int count : is_catmull_rom
+                       ? VtIntArray(spec.control_points.size() / 16, 4)
+                       : vertex_counts) {
     for (int j = 0; j < count - degree; ++j) {
       spec.segment_indices.push_back(accumulated_vertices + j);
     }

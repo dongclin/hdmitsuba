@@ -20,6 +20,7 @@ from collections.abc import Mapping
 import tempfile
 from typing import Any
 
+import drjit as dr
 import mitsuba as mi
 import numpy as np
 
@@ -272,39 +273,39 @@ def _create_empty_mitsuba_curve(curve_type: str, bsdf: Any) -> mi.Object:
     return mi.load_dict(curve_dict)
 
 
-# M_bspline^-1 @ M_catmullRom (tension 0.5), identical to
-# kCatmullRomToBSpline in curves.cc.
+# M_bspline^-1 @ M_catmullRom (tension 0.5).
 _CATMULL_ROM_TO_BSPLINE = (
-    np.array(
-        [[7, -4, 5, -2], [-2, 11, -4, 1], [1, -4, 11, -2], [-2, 5, -4, 7]],
-        dtype=np.float32,
+    dr.scalar.Matrix4f(
+        [[7, -4, 5, -2], [-2, 11, -4, 1], [1, -4, 11, -2], [-2, 5, -4, 7]]
     )
     / 6.0
 )
 
 
 def _catmull_rom_to_bspline(
-    points: np.ndarray, counts: np.ndarray, pinned: bool
-) -> tuple[np.ndarray, np.ndarray]:
+    points: mi.Float, counts: np.ndarray, pinned: bool
+) -> mi.Float:
   """Converts Catmull-Rom strands into disjoint 4-point B-spline segments."""
   first = -1 if pinned else 0
-  segment_counts = np.maximum(0, counts - 3 - 2 * first)
-  strand = np.repeat(np.arange(counts.size), segment_counts)
+  counts_dr = mi.Int32(counts)
+  segment_counts = dr.maximum(0, counts_dr - 3 - 2 * first)
+  strand = dr.repeat(dr.arange(mi.Int32, len(counts_dr)), segment_counts)
+  if len(strand) == 0:
+    return mi.Float()
   local = (
-      np.arange(strand.size)
-      - (np.cumsum(segment_counts) - segment_counts)[strand]
+      dr.arange(mi.Int32, len(strand))
+      - dr.gather(mi.Int32, dr.prefix_sum(segment_counts), strand)
       + first
-  )[:, None] + np.arange(4)
-  clamped = np.clip(local, 0, counts[strand, None] - 1)
-  anchor = (np.cumsum(counts) - counts)[strand, None] + clamped
-  windows = points[anchor]
-  if pinned:
-    windows[..., :3] = (
-        2.0 * windows[..., :3] - points[anchor + clamped - local, :3]
-    )
-  return (_CATMULL_ROM_TO_BSPLINE @ windows).reshape(-1, 4), np.full(
-      strand.size, 4
+      + mi.Array4i(0, 1, 2, 3)
   )
+  clamped = dr.clip(local, 0, dr.gather(mi.Int32, counts_dr, strand) - 1)
+  anchor = dr.gather(mi.Int32, dr.prefix_sum(counts_dr), strand) + clamped
+  w = [dr.gather(mi.Vector4f, points, anchor[k]) for k in range(4)]
+  if pinned:
+    for k in (0, 3):
+      nb = dr.gather(mi.Vector4f, points, anchor[k] + clamped[k] - local[k])
+      w[k] = 2.0 * w[k] - mi.Vector4f(nb.x, nb.y, nb.z, w[k].w)
+  return dr.ravel((_CATMULL_ROM_TO_BSPLINE @ mi.Matrix4f(*w)).T)
 
 
 def _convert_curves(
@@ -351,12 +352,12 @@ def _convert_curves(
   ):
     raise ValueError(
         f"Curves prim '{prim.GetPath()}': curveVertexCounts sum to "
-        f'{curve_point_counts.sum()} '
-        f'(min {curve_point_counts.min(initial=0)}) '
-        f'but there are {curve_points.shape[0]} points. Fix the curve '
+        f'{curve_point_counts.sum()} (min {curve_point_counts.min(initial=0)})'
+        f' but there are {curve_points.shape[0]} points. Fix the curve '
         'topology in the USD asset.'
     )
 
+  curve_points = mi.Float(curve_points.ravel())
   curve_type = 'linearcurve'
   if prim.IsA(UsdGeom.BasisCurves):
     basis_curves = UsdGeom.BasisCurves(prim)
@@ -365,11 +366,12 @@ def _convert_curves(
       if basis in (UsdGeom.Tokens.bspline, UsdGeom.Tokens.catmullRom):
         curve_type = 'bsplinecurve'
       if basis == UsdGeom.Tokens.catmullRom:
-        curve_points, curve_point_counts = _catmull_rom_to_bspline(
+        curve_points = _catmull_rom_to_bspline(
             curve_points,
             curve_point_counts,
             basis_curves.GetWrapAttr().Get(time) == UsdGeom.Tokens.pinned,
         )
+        curve_point_counts = np.full(len(curve_points) // 16, 4)
   elif prim.IsA(UsdGeom.NurbsCurves):
     curve_type = 'bsplinecurve'
   degree = 3 if curve_type == 'bsplinecurve' else 1
@@ -388,9 +390,9 @@ def _convert_curves(
 
   curve_obj = _create_empty_mitsuba_curve(curve_type, bsdf)
   params = mi.traverse(curve_obj)
-  params['control_point_count'] = curve_points.shape[0]
+  params['control_point_count'] = len(curve_points) // 4
   params['segment_indices'] = mi.Int32(curve_indices)
-  params['control_points'] = mi.Float(np.ravel(curve_points))
+  params['control_points'] = curve_points
   params.update()
   return curve_obj
 

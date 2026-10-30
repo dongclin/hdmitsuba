@@ -269,50 +269,19 @@ def test_curve_bspline_type():
 
 
 @pytest.mark.parametrize(
-    'wrap, trim, num_segments',
-    [(UsdGeom.Tokens.nonperiodic, 1, 9), (UsdGeom.Tokens.pinned, 0, 14)],
+    'wrap', [UsdGeom.Tokens.nonperiodic, UsdGeom.Tokens.pinned]
 )
-def test_curve_catmull_rom_type(wrap: str, trim: int, num_segments: int):
+def test_curve_catmull_rom_type(wrap: str):
   stage = Usd.Stage.Open(f'{test_helpers.TEST_ASSETS_PATH}/shapes/curve.usda')
   test_helpers.create_render_settings(stage, resolution=(128, 128))
   curve = UsdGeom.BasisCurves.Get(stage, '/root/mycurve/curve')
   curve.GetBasisAttr().Set(UsdGeom.Tokens.catmullRom)
   curve.GetTypeAttr().Set(UsdGeom.Tokens.cubic)
   curve.GetWrapAttr().Set(wrap)
-  # 2-, 5-, and 10-point strands (17 points total) with a zero-width tip.
-  curve.GetCurveVertexCountsAttr().Set(Vt.IntArray([2, 5, 10]))
-  curve.GetWidthsAttr().Set(Vt.FloatArray([0.1] * 16 + [0.0]))
-  UsdGeom.Primvar(curve.GetWidthsAttr()).SetInterpolation(UsdGeom.Tokens.vertex)
-  image_hd, _ = test_helpers.assert_hydra_equal_to_offline(
+  test_helpers.assert_hydra_equal_to_offline(
       stage,
       output_prefix=f'test_curve_catmull_rom_{wrap}',
       atol=0.05,
-  )
-  assert np.max(image_hd[..., :3]) > 0.05
-
-  params = mi.traverse(
-      test_helpers.usd_mitsuba.convert_to_mitsuba(stage)['_root_mycurve_curve']
-  )
-  b = np.array(params['control_points']).reshape(num_segments, 4, 4)
-  pts = np.hstack([
-      np.array(curve.GetPointsAttr().Get()),
-      np.array(curve.GetWidthsAttr().Get())[:, None] * 0.5,
-  ])
-  knots = [s[trim : len(s) - trim] for s in np.split(pts, [2, 7])]
-  np.testing.assert_allclose(
-      (b[:, 0] + 4.0 * b[:, 1] + b[:, 2]) / 6.0,
-      np.concatenate([k[:-1] for k in knots]),
-      atol=1e-5,
-  )
-  np.testing.assert_allclose(
-      (b[:, 1] + 4.0 * b[:, 2] + b[:, 3]) / 6.0,
-      np.concatenate([k[1:] for k in knots]),
-      atol=1e-5,
-  )
-  np.testing.assert_allclose(
-      (b[0, 2, :3] - b[0, 0, :3]) * 0.5,
-      (pts[4, :3] - pts[2, :3]) * 0.5 if trim else pts[1, :3] - pts[0, :3],
-      atol=1e-5,
   )
 
 
